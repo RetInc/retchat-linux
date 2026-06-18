@@ -7,6 +7,7 @@
 #include <openssl/evp.h>
 
 #include <random>
+#include <string>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -15,16 +16,19 @@
 
 #include <cstring>
 #include <iostream>
+#include <unordered_map>
 #include <vector>
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <fstream>
 
+constexpr int PROTOCOL_VERSION = 1;
 
 constexpr int KEEPALIVE_INTERVAL_SEC = 30;
 constexpr int KEEPALIVE_TIMEOUT_SEC  = 10;
 constexpr size_t KEY_LEN = 32;
-constexpr size_t MAX_MSG_LEN = 4096;
+constexpr size_t MAX_MSG_LEN = 2 * 1024 * 1024;  // 2 MB
 
 static const char* DH_PRIME_HEX =
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
@@ -44,7 +48,7 @@ Connection::Connection(MessageListener& listener)
 {
     dhPrime = BN_new();
     if (!dhPrime || BN_hex2bn(&dhPrime, DH_PRIME_HEX) == 0) {
-        std::cerr << "Invalid DH prime" << std::endl;
+        std::cerr << "invalid DH prime" << std::endl;
         exit(1);
     }
     dhGenerator = BN_new();
@@ -58,7 +62,6 @@ Connection::~Connection() {
 }
 
 BIGNUM* Connection::generatePrivateKey() const {
-    // 256bit private key
     std::random_device rd;
     std::mt19937_64 gen(rd());
     std::uniform_int_distribution<uint64_t> dis;
@@ -131,7 +134,6 @@ void Connection::deriveKeystream(uint64_t counter, uint8_t* out, size_t neededLe
         memcpy(out + copied, digest, chunk);
         copied += chunk;
         if (copied < neededLen) {
-            // re‑HMAC the previous digest to generate more stream
             HMAC_CTX* ctx2 = HMAC_CTX_new();
             HMAC_Init_ex(ctx2, encKey, KEY_LEN, EVP_sha256(), nullptr);
             HMAC_Update(ctx2, digest, sizeof(digest));
@@ -152,8 +154,9 @@ void Connection::hmacSha256(const uint8_t* key, size_t keyLen, const uint8_t* da
     HMAC(EVP_sha256(), key, (int)keyLen, data, dataLen, out, nullptr);
 }
 
+// --- connect with handshake ---
+
 void Connection::connect(const std::string& ip, int port) {
-    // resolve hostname
     struct addrinfo hints{}, *res;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -179,8 +182,7 @@ void Connection::connect(const std::string& ip, int port) {
     }
     freeaddrinfo(res);
 
-
-    // ---- Diffie‑Hellman handshake ----
+    // --- Diffie‑Hellman handshake ---
 
     BIGNUM* clientPriv = generatePrivateKey();
     BIGNUM* clientPub = computePublicKey(clientPriv);
@@ -229,10 +231,44 @@ void Connection::connect(const std::string& ip, int port) {
     // reset counters
     sendCounter = 0;
     recvCounter = 0;
+
+    // --- version exchange ---
+
+    // receive handshake
+    std::vector<uint8_t> plain;
+    if (!receiveFrame(plain)) {
+        listener.onSystemMessage("handshake: failed to receive server version", true);
+        close(sockfd); sockfd = -1;
+        return;
+    }
+    if (plain.empty() || plain[0] != static_cast<uint8_t>(PacketType::HANDSHAKE)) {
+        listener.onSystemMessage("handshake: unexpected packet type", true);
+        close(sockfd); sockfd = -1;
+        return;
+    }
+    if (plain.size() < 3) {  // type + 2 bytes version
+        listener.onSystemMessage("handshake: malformed version packet", true);
+        close(sockfd); sockfd = -1;
+        return;
+    }
+    uint16_t serverVersion = (plain[1] << 8) | plain[2];
+    if (serverVersion != PROTOCOL_VERSION) {
+        listener.onSystemMessage("server version mismatch (expected " + std::to_string(PROTOCOL_VERSION) + ", got " + std::to_string(serverVersion) + ")", true);
+        close(sockfd); sockfd = -1;
+        return;
+    }
+
+    // send handshake
+    running.store(true);
+    std::vector<uint8_t> verPayload;
+    verPayload.push_back((PROTOCOL_VERSION >> 8) & 0xFF);
+    verPayload.push_back((PROTOCOL_VERSION     ) & 0xFF);
+    sendPacket(PacketType::HANDSHAKE, verPayload);
+
+    // --- connection established ----
+
     lastReceiveTime = std::chrono::steady_clock::now();
     waitingForAck = false;
-
-    running.store(true);
     listener.onConnected();
 
     // start threads
@@ -254,6 +290,48 @@ void Connection::disconnect() {
     listener.onDisconnected();
 }
 
+
+// --- frame receive helper ---
+
+bool Connection::receiveFrame(std::vector<uint8_t>& outPlain) {
+    // read HMAC
+    uint8_t recvHmac[32];
+    if (recv(sockfd, recvHmac, 32, MSG_WAITALL) != 32)
+        return false;
+
+    // read length
+    uint32_t netLen;
+    if (recv(sockfd, &netLen, 4, MSG_WAITALL) != 4)
+        return false;
+    size_t msgLen = ntohl(netLen);
+    if (msgLen == 0 || msgLen > MAX_MSG_LEN)
+        return false;
+
+    // read ciphertext
+    std::vector<uint8_t> ciphertext(msgLen);
+    size_t total = 0;
+    while (total < msgLen) {
+        ssize_t got = recv(sockfd, ciphertext.data() + total, msgLen - total, MSG_WAITALL);
+        if (got <= 0) return false;
+        total += got;
+    }
+
+    // verify HMAC
+    uint8_t expectedHmac[32];
+    hmacSha256(encKey, KEY_LEN, ciphertext.data(), ciphertext.size(), expectedHmac);
+    if (CRYPTO_memcmp(recvHmac, expectedHmac, 32) != 0)
+        return false;   // tampered
+
+    // decrypt
+    xorCrypt(ciphertext.data(), ciphertext.size(), recvCounter);
+    ++recvCounter;
+
+    outPlain.swap(ciphertext);
+    return true;
+}
+
+// --- sendPacket (UPDATED) ---
+
 void Connection::sendPacket(PacketType type, const std::vector<uint8_t>& payload) {
     if (!running.load()) return;
 
@@ -273,20 +351,23 @@ void Connection::sendPacket(PacketType type, const std::vector<uint8_t>& payload
     uint8_t hmac[32];
     hmacSha256(encKey, KEY_LEN, ciphertext.data(), ciphertext.size(), hmac);
 
-    // length (big‑endian 16‑bit)
-    uint16_t len = htons(static_cast<uint16_t>(ciphertext.size()));
+    // length (4 bytes, network order)
+    uint32_t len = htonl(static_cast<uint32_t>(ciphertext.size()));
 
     // send
     if (send(sockfd, hmac, 32, 0) != 32) throw std::runtime_error("send HMAC failed");
-    if (send(sockfd, &len, 2, 0) != 2) throw std::runtime_error("send len failed");
+    if (send(sockfd, &len, 4, 0) != 4) throw std::runtime_error("send len failed");
     if (send(sockfd, ciphertext.data(), ciphertext.size(), 0) != (ssize_t)ciphertext.size())
         throw std::runtime_error("send ciphertext failed");
 }
 
+
+// --- public API ---
+
 void Connection::sendNick(const std::string& newNick) {
     resetIdleTimer();
     std::vector<uint8_t> payload(newNick.begin(), newNick.end());
-    payload.push_back(0);  // null terminator
+    payload.push_back(0);
     sendPacket(PacketType::NICK_REQUEST, payload);
 }
 
@@ -314,55 +395,67 @@ void Connection::sendDm(const std::string& targetNick, const std::string& text) 
     sendPacket(PacketType::DM_REQUEST, payload);
 }
 
+void Connection::sendImage(const std::string& target, const std::string& filepath) {
+    resetIdleTimer();
+
+    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        listener.onSystemMessage("cannot open image file: " + filepath, true);
+        return;
+    }
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> imageData(size);
+    if (!file.read(reinterpret_cast<char*>(imageData.data()), size)) {
+        listener.onSystemMessage("failed to read image file", true);
+        return;
+    }
+
+    std::string mimeType = getMimeType(filepath);
+    std::string fileName = filepath.substr(filepath.find_last_of("/\\") + 1);
+
+    // build payload: target, mimeType, fileName, imageData (all null-terminated strings except imageData)
+    std::vector<uint8_t> payload;
+    // target
+    payload.insert(payload.end(), target.begin(), target.end());
+    payload.push_back(0);
+    // mimeType
+    payload.insert(payload.end(), mimeType.begin(), mimeType.end());
+    payload.push_back(0);
+    // fileName
+    payload.insert(payload.end(), fileName.begin(), fileName.end());
+    payload.push_back(0);
+    // imageData
+    payload.insert(payload.end(), imageData.begin(), imageData.end());
+
+    sendPacket(PacketType::IMAGE_MSG, payload);
+}
+
+
+// --- receive loop ---
+
 void Connection::receiveLoop() {
     try {
         while (running.load()) {
-            // read HMAC
-            uint8_t recvHmac[32];
-            ssize_t r = recv(sockfd, recvHmac, 32, MSG_WAITALL);
-            if (r != 32) break;
-
-            // read length
-            uint16_t netLen;
-            if (recv(sockfd, &netLen, 2, MSG_WAITALL) != 2) break;
-            size_t msgLen = ntohs(netLen);
-            if (msgLen > MAX_MSG_LEN) break;
-
-            // read ciphertext
-            std::vector<uint8_t> ciphertext(msgLen);
-            size_t total = 0;
-            while (total < msgLen) {
-                ssize_t got = recv(sockfd, ciphertext.data() + total, msgLen - total, MSG_WAITALL);
-                if (got <= 0) break;
-                total += got;
-            }
-            if (total != msgLen) break;
-
-            // verify HMAC
-            uint8_t expectedHmac[32];
-            hmacSha256(encKey, KEY_LEN, ciphertext.data(), ciphertext.size(), expectedHmac);
-            if (CRYPTO_memcmp(recvHmac, expectedHmac, 32) != 0) {
-                continue;  // ignore tampered packet
-            }
+            std::vector<uint8_t> plain;
+            if (!receiveFrame(plain)) break;
 
             resetIdleTimer();
 
-            // decrypt
-            xorCrypt(ciphertext.data(), ciphertext.size(), recvCounter);
-            ++recvCounter;
-
-            // parse packet
-            if (ciphertext.empty()) continue;
-            PacketType type = static_cast<PacketType>(ciphertext[0]);
-            std::vector<uint8_t> payload(ciphertext.begin() + 1, ciphertext.end());
+            if (plain.empty()) continue;
+            PacketType type = static_cast<PacketType>(plain[0]);
+            std::vector<uint8_t> payload(plain.begin() + 1, plain.end());
             handlePacket(type, payload);
         }
-    } catch (const std::exception& _) {
-        // empty catch block
+    } catch (const std::exception&) {
+        // ignore
     }
     running.store(false);
     listener.onDisconnected();
 }
+
+
+// --- handlePacket ---
 
 void Connection::handlePacket(PacketType type, const std::vector<uint8_t>& payload) {
     size_t offset = 0;
@@ -410,14 +503,48 @@ void Connection::handlePacket(PacketType type, const std::vector<uint8_t>& paylo
         case PacketType::SYSTEM_MSG: {
             if (offset >= payload.size()) break;
             bool isError = payload[offset++] != 0;
-            std::string text = readString(payload.data(), offset, payload.size());
-            listener.onSystemMessage(text, isError);
+            if (offset + 2 > payload.size()) break;
+            uint16_t code = (payload[offset] << 8) | payload[offset + 1];
+            offset += 2;
+            if (offset >= payload.size()) break;
+            uint8_t paramCount = payload[offset++];
+            std::vector<std::string> params;
+            for (uint8_t i = 0; i < paramCount; ++i) {
+                std::string p = readString(payload.data(), offset, payload.size());
+                params.push_back(p);
+            }
+            std::string msg;
+            if (code == 1) {
+                msg = "welcome, " + (params.size() > 0 ? params[0] : "?") +
+                      ", you're in: " + (params.size() > 1 ? params[1] : "?");
+            } else {
+                // generic: append params
+                msg = "system message";
+                if (!params.empty()) {
+                    msg += " (";
+                    for (size_t i = 0; i < params.size(); ++i) {
+                        if (i > 0) msg += ", ";
+                        msg += params[i];
+                    }
+                    msg += ")";
+                }
+            }
+            listener.onSystemMessage(msg, isError);
             break;
         }
         case PacketType::DM_MSG: {
             std::string sender = readString(payload.data(), offset, payload.size());
             std::string text = readString(payload.data(), offset, payload.size());
             listener.onDirectMessage(sender, text);
+            break;
+        }
+        case PacketType::IMAGE_MSG: {   // NEW
+            std::string sender = readString(payload.data(), offset, payload.size());
+            std::string target = readString(payload.data(), offset, payload.size());
+            std::string mimeType = readString(payload.data(), offset, payload.size());
+            std::string fileName = readString(payload.data(), offset, payload.size());
+            std::vector<uint8_t> imageData(payload.begin() + offset, payload.end());
+            listener.onImageMessage(sender, target, mimeType, fileName, imageData);
             break;
         }
         case PacketType::KICK: {
@@ -441,6 +568,9 @@ void Connection::handlePacket(PacketType type, const std::vector<uint8_t>& paylo
     }
 }
 
+
+// --- utility ---
+
 std::string Connection::readString(const uint8_t* data, size_t& offset, size_t maxLen) {
     size_t start = offset;
     while (offset < maxLen && data[offset] != 0)
@@ -449,6 +579,27 @@ std::string Connection::readString(const uint8_t* data, size_t& offset, size_t m
     if (offset < maxLen) ++offset;  // skip null
     return s;
 }
+
+std::string Connection::getMimeType(const std::string& filepath) {
+    static const std::unordered_map<std::string, std::string> extMap = {
+        {".png", "image/png"},
+        {".jpg", "image/jpeg"},
+        {".jpeg", "image/jpeg"},
+        {".webp", "image/webp"},
+        {".avif", "image/avif"},
+        {".gif", "image/gif"},
+        {".bmp", "image/bmp"}
+    };
+    size_t dot = filepath.find_last_of('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+    std::string ext = filepath.substr(dot);
+    auto it = extMap.find(ext);
+    if (it != extMap.end()) return it->second;
+    return "application/octet-stream";
+}
+
+
+// --- keep‑alive ---
 
 void Connection::startKeepAlive() {
     keepAliveRunning = true;
@@ -462,7 +613,6 @@ void Connection::startKeepAlive() {
 
             if (waitingForAck) {
                 if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastKeepAliveSent).count() > KEEPALIVE_TIMEOUT_SEC * 1000LL) {
-                    // timeout
                     listener.onSystemMessage("keepalive timeout, disconnecting", true);
                     disconnect();
                 }

@@ -20,6 +20,7 @@ enum class PacketType : uint8_t {
     SYSTEM_MSG      = 0x21,
     DM_REQUEST      = 0x22,
     DM_MSG          = 0x23,
+    IMAGE_MSG       = 0x24,
 
     DISCONNECT      = 0x30,
     KICK            = 0x31,

@@ -28,6 +28,11 @@ public:
     virtual void onDirectMessage(const std::string& sender, const std::string& text) = 0;
     virtual void onKicked(const std::string& reason) = 0;
     virtual void onBanned(const std::string& reason) = 0;
+    virtual void onImageMessage(const std::string& sender,
+                                const std::string& target,
+                                const std::string& mimeType,
+                                const std::string& fileName,
+                                const std::vector<uint8_t>& imageData) = 0;
 };
 
 class Connection {
@@ -47,6 +52,7 @@ public:
     void sendJoin(const std::string& room);
     void sendChat(const std::string& text);
     void sendDm(const std::string& targetNick, const std::string& text);
+    void sendImage(const std::string& target, const std::string& filepath);
 
 private:
     // DH helpers
@@ -62,6 +68,7 @@ private:
 
     // packet I/O
     void sendPacket(PacketType type, const std::vector<uint8_t>& payload);
+    bool receiveFrame(std::vector<uint8_t>& outPlain);
     void receiveLoop();
     void handlePacket(PacketType type, const std::vector<uint8_t>& payload);
 
@@ -72,6 +79,7 @@ private:
 
     // utility
     static std::string readString(const uint8_t* data, size_t& offset, size_t maxLen);
+    static std::string getMimeType(const std::string& filepath);
 
     MessageListener& listener;
 

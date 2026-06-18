@@ -1,7 +1,9 @@
 #include "Connection.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
+#include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <string>
@@ -89,6 +91,65 @@ private:
         running = false;
     }
 
+    void onImageMessage(const std::string& sender,
+                        const std::string& target,
+                        const std::string& mimeType,
+                        const std::string& fileName,
+                        const std::vector<uint8_t>& imageData) override {
+        std::string label = target.empty() ? "room" : "DM from " + sender;
+        print("[IMAGE] " + label + " | mime: " + mimeType +
+              " | file: " + fileName + " | size: " + std::to_string(imageData.size()) + " bytes");
+
+        // prompt user to save
+        std::cout << "save image? (y/n): " << std::flush;
+        std::string answer;
+        std::getline(std::cin, answer);
+        if (answer != "y" && answer != "Y") {
+            print("[INFO] image discarded");
+            return;
+        }
+
+        // generate filename
+        std::string saveName = fileName;
+        if (saveName.empty()) {
+            auto now = std::chrono::system_clock::now();
+            auto time_t = std::chrono::system_clock::to_time_t(now);
+            std::string ext;
+            if (mimeType == "image/png") ext = ".png";
+            else if (mimeType == "image/jpeg") ext = ".jpg";
+            else if (mimeType == "image/webp") ext = ".webp";
+            else if (mimeType == "image/avif") ext = ".avif";
+            else ext = ".bin";
+            saveName = "image_" + std::to_string(time_t) + ext;
+        } else {
+            // avoid overwriting
+            std::ifstream test(saveName);
+            if (test.good()) {
+                test.close();
+                int counter = 1;
+                std::string base = saveName;
+                size_t dot = saveName.find_last_of('.');
+                std::string ext = (dot == std::string::npos) ? "" : saveName.substr(dot);
+                if (dot != std::string::npos) base = saveName.substr(0, dot);
+                while (true) {
+                    std::string candidate = base + "_" + std::to_string(counter) + ext;
+                    std::ifstream t(candidate);
+                    if (!t.good()) { saveName = candidate; break; }
+                    ++counter;
+                }
+            }
+        }
+
+        std::ofstream out(saveName, std::ios::binary);
+        if (!out) {
+            print("[ERROR] could not save image to " + saveName);
+            return;
+        }
+        out.write(reinterpret_cast<const char*>(imageData.data()), imageData.size());
+        out.close();
+        print("[INFO] image saved to " + saveName);
+    }
+
     // --- input ---
 
     void processInput(const std::string& line) {
@@ -129,6 +190,26 @@ private:
                 print("[DM to " + target + "] " + text);
             } catch (const std::exception& e) { print("[ERROR] " + std::string(e.what())); }
 
+        } else if (cmd == "image") {
+            std::string target, filepath;
+            size_t sp2 = arg.find(' ');
+            if (sp2 == std::string::npos) {
+                filepath = arg;
+                target.clear();
+            } else {
+                target = arg.substr(0, sp2);
+                filepath = arg.substr(sp2 + 1);
+                if (filepath.empty()) {
+                    print("[ERROR] usage: /image (target) <filepath>");
+                    return;
+                }
+            }
+            try {
+                conn.sendImage(target, filepath);
+            } catch (const std::exception& e) {
+                print("[ERROR] " + std::string(e.what()));
+            }
+
         } else if (cmd == "quit" || cmd == "exit") {
             running = false;
             conn.disconnect();
@@ -143,8 +224,8 @@ private:
     }
 
     int port;
-    std::string ip; 
-    std::string initialNick; 
+    std::string ip;
+    std::string initialNick;
     std::string initialRoom;
     std::string currentNick;
     std::string currentRoom = "lobby";

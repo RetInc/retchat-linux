@@ -1,2 +1,7 @@
 todo.txt
 build/
+*.png
+*.jpg
+*.webp
+*.avif
+*.gif
