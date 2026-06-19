@@ -1,6 +1,7 @@
 #include "Connection.hpp"
 
 #include "PacketTypes.hpp"
+#include "SystemMessages.hpp"
 
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
@@ -513,22 +514,7 @@ void Connection::handlePacket(PacketType type, const std::vector<uint8_t>& paylo
                 std::string p = readString(payload.data(), offset, payload.size());
                 params.push_back(p);
             }
-            std::string msg;
-            if (code == 1) {
-                msg = "welcome, " + (params.size() > 0 ? params[0] : "?") +
-                      ", you're in: " + (params.size() > 1 ? params[1] : "?");
-            } else {
-                // generic: append params
-                msg = "system message";
-                if (!params.empty()) {
-                    msg += " (";
-                    for (size_t i = 0; i < params.size(); ++i) {
-                        if (i > 0) msg += ", ";
-                        msg += params[i];
-                    }
-                    msg += ")";
-                }
-            }
+            std::string msg = formatSystemMessage(code, params);
             listener.onSystemMessage(msg, isError);
             break;
         }
@@ -538,7 +524,7 @@ void Connection::handlePacket(PacketType type, const std::vector<uint8_t>& paylo
             listener.onDirectMessage(sender, text);
             break;
         }
-        case PacketType::IMAGE_MSG: {   // NEW
+        case PacketType::IMAGE_MSG: {
             std::string sender = readString(payload.data(), offset, payload.size());
             std::string target = readString(payload.data(), offset, payload.size());
             std::string mimeType = readString(payload.data(), offset, payload.size());
